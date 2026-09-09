@@ -622,7 +622,10 @@ function _updatePanelInner(d,_force=false){
         for(const[l,key]of sceneFields){
             const r=document.createElement('div');r.className='sp-row';r.dataset.ft=key;
             // v6.9.5: tension row gets a visual meter class
-            if (key === 'sceneTension' && _tension) r.classList.add('sp-scene-tension-row', 'sp-tension-' + _tension);
+            if (key === 'sceneTension' && _tension) {
+                r.classList.add('sp-scene-tension-row');
+                if (Object.prototype.hasOwnProperty.call(_tensionColors, _tension)) r.classList.add('sp-tension-' + _tension);
+            }
             // v6.9.5: sounds get italic/muted styling
             if (key === 'soundEnvironment') r.classList.add('sp-scene-sounds-row');
             // v6.9.5: changed-this-turn indicator dot
