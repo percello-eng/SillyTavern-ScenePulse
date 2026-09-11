@@ -793,6 +793,20 @@ export function getWikiArchive(){
     return _ensureArchive(data);
 }
 
+// Stable fingerprint for the selected assistant-message text. This is
+// provenance, not security: FNV-1a 64-bit is used because it is synchronous,
+// deterministic across browsers/Node, and cheap even for long RP messages.
+export function getMessageFingerprint(message){
+    const text=String(message?.mes??'');
+    let hash=0xcbf29ce484222325n;
+    const prime=0x100000001b3n;
+    for(let i=0;i<text.length;i++){
+        hash^=BigInt(text.charCodeAt(i));
+        hash=BigInt.asUintN(64,hash*prime);
+    }
+    return text.length+':'+hash.toString(16).padStart(16,'0');
+}
+
 export function saveSnapshot(id,j){
     const data=getTrackerData();
     // v6.16.2: stamp savedAt on every snapshot at write time so the inspector's
@@ -802,6 +816,19 @@ export function saveSnapshot(id,j){
     if(j && typeof j === 'object'){
         if(!j._spMeta || typeof j._spMeta !== 'object') j._spMeta = {};
         j._spMeta.savedAt = new Date().toISOString();
+        const srcMessage=SillyTavern.getContext()?.chat?.[Number(id)];
+        if(!Object.prototype.hasOwnProperty.call(j._spMeta,'srcSendDate')){
+            const srcSendDate=srcMessage?.send_date;
+            if(srcSendDate!==undefined&&srcSendDate!==null){
+                j._spMeta.srcSendDate=srcSendDate;
+            }
+        }
+        if(!Object.prototype.hasOwnProperty.call(j._spMeta,'srcSwipeId')&&srcMessage&&!srcMessage.is_user){
+            j._spMeta.srcSwipeId=Number(srcMessage.swipe_id??0);
+        }
+        if(!Object.prototype.hasOwnProperty.call(j._spMeta,'srcMessageFingerprint')&&srcMessage&&!srcMessage.is_user){
+            j._spMeta.srcMessageFingerprint=getMessageFingerprint(srcMessage);
+        }
     }
     data.snapshots[String(id)]=j;
     // v6.22.1: update the wiki archive BEFORE pruning, so even if this

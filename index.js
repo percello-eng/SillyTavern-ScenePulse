@@ -40,7 +40,7 @@ import { createPanel } from './src/ui/panel.js';
 import { updatePanel } from './src/ui/update-panel.js';
 import { clearWeatherOverlay } from './src/ui/weather.js';
 import { clearTimeTint } from './src/ui/time-tint.js';
-import { onCharMsg, renderExisting, spOnMessageDeleted } from './src/ui/message.js';
+import { onCharMsg, renderExisting, spOnMessageDeleted, spOnMessageSwiped, spOnContinueStarted, spReconcileSnapshots } from './src/ui/message.js';
 import { cleanupGenUI, clearThoughtLoading } from './src/ui/loading.js';
 
 // ── Settings UI ──
@@ -182,6 +182,9 @@ eventSource.on(event_types.APP_READY, async () => { try {
 } catch (e) { err('APP_READY:', e); } });
 
 eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, idx => onCharMsg(idx));
+eventSource.on(event_types.GENERATION_STARTED, (type, _opts, dryRun) => {
+    if(type==='continue'&&!dryRun)spOnContinueStarted();
+});
 
 // v6.27.16: stream-stall detector. Each token received refreshes the
 // stall watchdog (see src/generation/interceptor.js). When the stream
@@ -290,8 +293,15 @@ eventSource.on(event_types.GENERATION_STOPPED, () => {
 });
 
 eventSource.on(event_types.CHAT_CHANGED, async () => {
+    // Reconcile data while SillyTavern is still awaiting CHAT_CHANGED. UI
+    // rendering remains delayed below, but stale inherited snapshots must not
+    // remain canonical during the post-load window.
+    try{await spReconcileSnapshots()}
+    catch(e){warn('CHAT_CHANGED snapshot reconciliation:',e)}
     try { await ensureChatSaved(); } catch (e) { warn('CHAT_CHANGED save:', e); }
-    if (generating) cancelGeneration();
+    if (generating) {
+        cancelGeneration();
+    }
     const tp = document.getElementById('sp-thought-panel');
     if (tp) { tp.classList.remove('sp-tp-visible'); const tpb = document.getElementById('sp-tp-body'); if (tpb) tpb.innerHTML = ''; }
     clearWeatherOverlay();
@@ -314,12 +324,21 @@ eventSource.on(event_types.CHAT_CHANGED, async () => {
     // v6.9.14: renderExisting → updatePanel now reads getActivePanels()
     // which returns the new chat's chatPanels automatically. No manual
     // per-panel visibility sync needed.
-    setTimeout(() => {
-        renderExisting();
+    setTimeout(async () => {
+        await renderExisting();
         const msgs = document.querySelectorAll('.mes');
         if (msgs.length === 0) setTimeout(renderExisting, 500);
     }, 200);
 });
+
+// Swipe lifecycle — reject state derived from the outgoing swipe before
+// SillyTavern assembles any replacement generation.
+if (event_types.MESSAGE_SWIPED) {
+    eventSource.on(event_types.MESSAGE_SWIPED, (idx) => {
+        log('MESSAGE_SWIPED event, idx=', idx);
+        spOnMessageSwiped(Number(idx));
+    });
+}
 
 // Message deleted — remove associated snapshot and refresh timeline
 if (event_types.MESSAGE_DELETED) {
@@ -328,7 +347,7 @@ if (event_types.MESSAGE_DELETED) {
         spOnMessageDeleted(Number(idx));
     });
 }
-// Also catch swipe/edit which may renumber messages
+// Also catch edits which may renumber messages
 if (event_types.MESSAGE_UPDATED) {
     eventSource.on(event_types.MESSAGE_UPDATED, () => { setTimeout(renderExisting, 300); });
 }

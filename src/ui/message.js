@@ -4,11 +4,11 @@ import { t } from '../i18n.js';
 import { MES_ICON_SVG } from '../constants.js';
 import { SP_MARKER_START } from '../generation/extraction.js';
 import { getSettings } from '../settings.js';
-import { getTrackerData, getLatestSnapshot, getSnapshotFor, saveSnapshot } from '../settings.js';
+import { getTrackerData, getLatestSnapshot, getSnapshotFor, saveSnapshot, getMessageFingerprint } from '../settings.js';
 import { normalizeTracker } from '../normalize.js';
 import { esc } from '../utils.js';
 import {
-    generating, genNonce, setLastGenSource,
+    generating, genNonce, setGenNonce, setLastGenSource,
     genMeta, setGenMeta,
     currentSnapshotMesIdx, setCurrentSnapshotMesIdx,
     inlineExtractionDone, setInlineExtractionDone,
@@ -17,7 +17,7 @@ import {
     _inlineWaitTimerId, set_inlineWaitTimerId,
     cancelRequested
 } from '../state.js';
-import { generateTracker, continuationReprompt } from '../generation/engine.js';
+import { generateTracker, continuationReprompt, cancelGeneration, getScenePulseChatIdentity } from '../generation/engine.js';
 import { extractInlineTracker } from '../generation/extraction.js';
 import { stopStreamingHider } from '../generation/streaming.js';
 import { processExtraction } from '../generation/pipeline.js';
@@ -29,8 +29,194 @@ import { updateThoughts } from './thoughts.js';
 import { createPanel, showPanel, hidePanel } from './panel.js';
 import { renderTimeline } from './timeline.js';
 
+function _parseTimestamp(value){
+    if(value===undefined||value===null||value==='')return null;
+    const ms=Date.parse(value);
+    return Number.isFinite(ms)?ms:null;
+}
+
+// Return null when a snapshot can be attributed to the currently selected
+// assistant-message version, otherwise a concise removal reason. New v4
+// snapshots use exact message fingerprints. Legacy snapshots use only
+// evidence available retrospectively and are treated conservatively at the
+// canonical terminal snapshot when swipe provenance cannot be established.
+function snapshotProvenanceMismatchReason(snap,msg,{terminal=false}={}){
+    if(!msg)return 'orphan';
+    if(msg.is_user)return 'snapshot belongs to user message';
+    const meta=snap?._spMeta||{};
+    const currentSendDate=msg.send_date;
+
+    if(meta.srcMessageFingerprint){
+        if(meta.srcSendDate!==undefined&&meta.srcSendDate!==null&&
+           currentSendDate!==undefined&&currentSendDate!==null&&
+           meta.srcSendDate!==currentSendDate)return 'send_date mismatch';
+        if(getMessageFingerprint(msg)!==meta.srcMessageFingerprint){
+            // A manual in-place edit changes message text without changing
+            // send_date or the selected swipe. Preserve the baseline behaviour
+            // in that case: keep the existing snapshot rather than falling back
+            // to an older canonical state. Rejected/replaced generations still
+            // fail via changed send_date and/or selected swipe.
+            const sameSwipe=Number(msg.swipe_id??0)===Number(meta.srcSwipeId??0);
+            const sameDate=meta.srcSendDate!==undefined&&meta.srcSendDate!==null&&
+                currentSendDate!==undefined&&currentSendDate!==null&&
+                meta.srcSendDate===currentSendDate;
+            if(!(sameDate&&sameSwipe))return 'message fingerprint mismatch';
+        }
+        return null;
+    }
+
+    // Transitional v2/v3 provenance: timestamp is useful unless the selected
+    // timestamp is shared by several swipes, where it cannot prove ownership.
+    if(meta.srcSendDate!==undefined&&meta.srcSendDate!==null){
+        if(currentSendDate!==undefined&&currentSendDate!==null&&meta.srcSendDate!==currentSendDate){
+            return 'send_date mismatch';
+        }
+        if(terminal&&Array.isArray(msg.swipes)&&msg.swipes.length>1){
+            const sameDate=(msg.swipe_info||[]).filter(info=>info?.send_date===currentSendDate).length;
+            if(sameDate>1)return 'ambiguous legacy swipe provenance';
+        }
+        return null;
+    }
+
+    // Legacy pre-provenance snapshot. A message version created after the
+    // snapshot was saved cannot possibly be its source.
+    const savedMs=_parseTimestamp(meta.savedAt);
+    const messageMs=_parseTimestamp(currentSendDate);
+    if(savedMs!==null&&messageMs!==null&&messageMs>savedMs){
+        return 'legacy snapshot predates selected message version';
+    }
+
+    // Only the terminal snapshot is canonical injection state. For legacy
+    // multi-swipe terminals, infer the most recent swipe that existed by
+    // savedAt. If that inference is tied/absent, ownership is unproven and
+    // the terminal snapshot is safer to discard than inject into a new branch.
+    if(terminal&&savedMs!==null&&Array.isArray(msg.swipes)&&msg.swipes.length>1){
+        const candidates=[];
+        for(let i=0;i<(msg.swipe_info||[]).length;i++){
+            const swipeMs=_parseTimestamp(msg.swipe_info?.[i]?.send_date);
+            if(swipeMs!==null&&swipeMs<=savedMs)candidates.push({i,swipeMs});
+        }
+        if(!candidates.length)return 'legacy swipe provenance unproven';
+        const latestMs=Math.max(...candidates.map(x=>x.swipeMs));
+        const latest=candidates.filter(x=>x.swipeMs===latestMs);
+        if(latest.length!==1)return 'ambiguous legacy swipe provenance';
+        if(latest[0].i!==Number(msg.swipe_id??0))return 'legacy snapshot belongs to different swipe';
+    }
+
+    // Pre-v6.16.2 snapshots without savedAt cannot be attributed further.
+    return null;
+}
+
+function invalidateTrackerWork(reason, mesIdx, abortST=true){
+    const oldNonce=genNonce;
+    if(generating){
+        log(reason+': cancelling active tracker generation, idx=',mesIdx,'abortST=',abortST);
+        cancelGeneration({abortST});
+    }else{
+        setGenNonce(oldNonce+1);
+        log(reason+': lifecycle nonce',oldNonce,'->',oldNonce+1,'idx=',mesIdx);
+    }
+}
+
+function discardSnapshotsFrom(mesIdx, reason){
+    const idx=Number(mesIdx);
+    const data=getTrackerData();
+    const removed=Object.keys(data.snapshots||{})
+        .map(Number)
+        .filter(k=>Number.isInteger(k)&&k>=idx)
+        .sort((a,b)=>a-b);
+    for(const k of removed){
+        delete data.snapshots[String(k)];
+        log(reason+': removed snapshot key=',k);
+    }
+    if(removed.length){
+        renderTimeline();
+        spSetGenerating(false);
+        setTimeout(renderExisting,0);
+    }else{
+        log(reason+': no snapshots at/after idx=',idx,'to discard');
+    }
+    return removed;
+}
+
+export function spOnContinueStarted(){
+    const s=getSettings();
+    if(!s.enabled||s.injectionMethod!=='separate')return;
+    const{chat}=SillyTavern.getContext();
+    const idx=chat.length-1;
+    if(idx<0||!chat[idx]||chat[idx].is_user)return;
+    invalidateTrackerWork('GENERATION_STARTED continue',idx,true);
+}
+
+export function spOnMessageSwiped(mesIdx){
+    const idx=Number(mesIdx);
+    const{chat}=SillyTavern.getContext();
+    const msg=chat[idx];
+    if(!Number.isInteger(idx)||idx<0||!msg||msg.is_user){
+        log('MESSAGE_SWIPED: invalid/non-assistant idx, skipping:',mesIdx);
+        return;
+    }
+
+    invalidateTrackerWork('MESSAGE_SWIPED',idx,true);
+    discardSnapshotsFrom(idx,'MESSAGE_SWIPED');
+
+    const swipeId=Number(msg.swipe_id??0);
+    const swipeCount=Array.isArray(msg.swipes)?msg.swipes.length:0;
+    const awaitingReplacement=swipeCount>0&&swipeId>=swipeCount;
+    if(awaitingReplacement){
+        log('MESSAGE_SWIPED: replacement generation pending for idx=',idx,
+            'swipeId=',swipeId,'swipeCount=',swipeCount);
+        return;
+    }
+
+    log('MESSAGE_SWIPED: existing swipe selected; scheduling retrack for idx=',idx,
+        'swipeId=',swipeId,'swipeCount=',swipeCount);
+    setTimeout(()=>{onCharMsg(idx).catch(e=>warn('MESSAGE_SWIPED retrack:',e));},0);
+}
+
+export async function spReconcileSnapshots(){
+    const ctx=SillyTavern.getContext();
+    const chat=ctx.chat;
+    if(ctx.chatId===undefined||ctx.chatId===null){
+        log('CHAT_CHANGED: snapshot reconciliation skipped (chatId unavailable)');
+        return 0;
+    }
+    if(!Array.isArray(chat)||chat.length===0){
+        log('CHAT_CHANGED: snapshot reconciliation skipped (chat empty/transient)');
+        return 0;
+    }
+
+    const data=getTrackerData();
+    const validAssistantKeys=Object.keys(data.snapshots||{})
+        .map(Number)
+        .filter(idx=>Number.isInteger(idx)&&idx>=0&&chat[idx]&&!chat[idx].is_user);
+    const terminalIdx=validAssistantKeys.length?Math.max(...validAssistantKeys):-1;
+    const removals=[];
+    for(const key of Object.keys(data.snapshots||{})){
+        const idx=Number(key);
+        const snap=data.snapshots[key];
+        if(!Number.isInteger(idx)||idx<0||!chat[idx]){
+            removals.push({key,reason:'orphan'});
+            continue;
+        }
+        const reason=snapshotProvenanceMismatchReason(snap,chat[idx],{terminal:idx===terminalIdx});
+        if(reason)removals.push({key,reason});
+    }
+
+    if(!removals.length)return 0;
+    for(const r of removals){
+        delete data.snapshots[r.key];
+        log('CHAT_CHANGED: removed snapshot key=',r.key,'reason=',r.reason);
+    }
+    try{await ctx.saveMetadata()}catch(e){warn('CHAT_CHANGED reconciliation save:',e)}
+    return removals.length;
+}
+
 // Delete snapshot and refresh timeline when a message is deleted
 export function spOnMessageDeleted(mesIdx){
+    // Regenerate has already created its replacement abort controller here:
+    // invalidate ScenePulse without touching SillyTavern's request.
+    invalidateTrackerWork('MESSAGE_DELETED',mesIdx,false);
     const data=getTrackerData();
     const key=String(mesIdx);
     if(data.snapshots[key]){
@@ -265,16 +451,48 @@ export async function onCharMsg(idx){
 
     // ── SEPARATE MODE: Auto-generate via separate API call ──
     let snap=getSnapshotFor(idx);
+
+    // A snapshot is valid only for the assistant-message version from
+    // which it was derived. v4 fingerprints survive swipe renumbering while
+    // distinguishing same-timestamp alternative swipes and edited text.
+    if(snap){
+        const mismatch=snapshotProvenanceMismatchReason(snap,chat[idx],{terminal:true});
+        if(mismatch){
+            log('onCharMsg: snapshot provenance mismatch idx=',idx,'reason=',mismatch);
+            invalidateTrackerWork('onCharMsg provenance mismatch',idx,false);
+            const removed=discardSnapshotsFrom(idx,'onCharMsg provenance mismatch');
+            if(removed.length){
+                try{await SillyTavern.getContext().saveMetadata()}
+                catch(e){warn('onCharMsg provenance mismatch save:',e)}
+            }
+            snap=null;
+        }
+    }
+
     if(!snap&&s.autoGenerate){
         // CRITICAL: Save the chat to disk FIRST, then wait for ST to finish all post-save hooks.
         // withProfileAndPreset triggers connection_profile_loaded -> CHAT_CHANGED -> chat reload.
         // If the message isn't saved to disk yet, it gets lost in the reload.
         log('onCharMsg: saving chat and waiting 4s before auto-gen...');
         setLastGenSource('auto:separate');
+        const lifecycleNonce=genNonce;
+        const lifecycleChatIdentity=getScenePulseChatIdentity();
         await ensureChatSaved();
         await new Promise(r=>setTimeout(r,4000));
+        if(genNonce!==lifecycleNonce){
+            log('onCharMsg: lifecycle changed during 4s delay, aborting idx=',idx,
+                'nonce=',lifecycleNonce,'current=',genNonce);
+            return;
+        }
         // Re-check after delay -- chat may have changed, or user may have cancelled
-        const{chat:freshChat}=SillyTavern.getContext();
+        const freshContext=SillyTavern.getContext();
+        const freshChatIdentity=getScenePulseChatIdentity(freshContext);
+        if(freshChatIdentity!==lifecycleChatIdentity){
+            log('onCharMsg: chat changed during 4s delay, aborting idx=',idx,
+                'from=',lifecycleChatIdentity,'to=',freshChatIdentity);
+            return;
+        }
+        const freshChat=freshContext.chat;
         if(!freshChat[idx]){log('onCharMsg: message gone after delay, aborting');return}
         if(generating){log('onCharMsg: already generating after delay, skipping');return}
         const panel=document.getElementById('sp-panel');

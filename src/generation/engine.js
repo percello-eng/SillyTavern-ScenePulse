@@ -23,7 +23,7 @@ import { record as recordNetwork } from '../network-log.js';
 import {
     getSettings, getActiveSchema, getActivePrompt, getTrackerData,
     getLatestSnapshot, saveSnapshot, getSnapshotFor, ensureChatSaved,
-    getConnectionProfiles, getChatPresets, shouldUseDelta
+    getConnectionProfiles, getChatPresets, shouldUseDelta, getMessageFingerprint
 } from '../settings.js';
 import { normalizeTracker } from '../normalize.js';
 import { applyPromptRole } from '../prompts/role.js';
@@ -33,7 +33,7 @@ import { spSetGenerating, spPostGenShow } from '../ui/mobile.js';
 import { updatePanel } from '../ui/update-panel.js';
 import { cleanupGenUI } from '../ui/loading.js';
 import { setBrandState } from '../ui/panel.js';
-import { startStWatchdog } from './st-watchdog.js';
+import { startStWatchdog, stopStWatchdog } from './st-watchdog.js';
 
 // Apply built-in preset values by temporarily adjusting ST's sampler sliders
 export function applyBuiltinPreset(){
@@ -70,36 +70,205 @@ export function restorePresetValues(){
     set_savedSamplerValues(null);
 }
 
-export async function withProfileAndPreset(pid,pre,fn){
-    const ctx=SillyTavern.getContext();let pp=null,pr=null;
-    // Save chat BEFORE switching profile — prevents message loss if switch triggers CHAT_CHANGED
-    if(pid||pre)await ensureChatSaved();
-    if(pid){try{pp=document.querySelector('#connection_profiles, #connection_profile')?.value;if(typeof ctx.setConnectionProfile==='function')await ctx.setConnectionProfile(pid);else{const s=document.querySelector('#connection_profiles, #connection_profile');if(s){s.value=pid;s.dispatchEvent(new Event('change'));await new Promise(r=>setTimeout(r,300))}}}catch(e){warn('Profile:',e)}}
-    // v6.23.7: empty preset is "(Same as current)" — leave the active preset
-    // alone (no switch, no sampler mutation). Pre-v6.23.7 the empty branch
-    // implicitly called applyBuiltinPreset() to swap in GLM-5 sampler values
-    // (temp 0.6, top_p 0.95, etc.), which (a) made user sliders move
-    // unexpectedly during fallback and (b) was inconsistent with the profile
-    // dropdown's clean "(Same as current)" semantics. Users who want
-    // GLM-5 samplers can now save them as an explicit preset and select it.
-    if(pre){try{for(const sel of['#settings_preset_openai','#settings_preset_chat']){const el=document.querySelector(sel);if(el){const has=Array.from(el.options).some(o=>o.value===pre);if(has){pr=el.value;el.value=pre;el.dispatchEvent(new Event('change'));await new Promise(r=>setTimeout(r,200));break}}}}catch(e){warn('Preset:',e)}}
-    try{return await fn()}finally{
-        // Save chat BEFORE restoring profile — the generation may have saved new data
-        await ensureChatSaved();
-        // Longer delay: profile restore triggers connection_profile_loaded → other extensions → CHAT_CHANGED
-        await new Promise(r=>setTimeout(r,2000));
-        if(pr){try{for(const sel of['#settings_preset_openai','#settings_preset_chat']){const el=document.querySelector(sel);if(el){el.value=pr;el.dispatchEvent(new Event('change'));break}}}catch{}}
-        if(pp){try{if(typeof ctx.setConnectionProfile==='function')await ctx.setConnectionProfile(pp);else{const s=document.querySelector('#connection_profiles, #connection_profile');if(s){s.value=pp;s.dispatchEvent(new Event('change'))}}}catch{}}
+let _profileWorkTail=Promise.resolve();
+let _spRequestSeq=0;
+let _activeSpRequest=null;
+
+function _sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+async function _ensureChatSavedBounded(label,timeoutMs=20000){
+    let timedOut=false;
+    let timer=null;
+    try{
+        await Promise.race([
+            Promise.resolve().then(()=>ensureChatSaved()),
+            new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve()},timeoutMs)}),
+        ]);
+    }finally{
+        if(timer)clearTimeout(timer);
     }
+    if(timedOut)warn(`${label}: chat save did not settle within ${Math.round(timeoutMs/1000)}s; continuing to avoid wedging the profile queue`);
 }
 
-// Cancel: synchronous, instant. Restores UI immediately AND aborts ST's in-flight HTTP request.
-export function cancelGeneration(){
+export function getScenePulseChatIdentity(ctx=SillyTavern.getContext()){
+    const chatId=ctx?.chatId;
+    if(chatId===undefined||chatId===null||chatId==='')return null;
+    const groupId=ctx?.groupId;
+    if(groupId!==undefined&&groupId!==null&&groupId!=='')return `g|${groupId}|${chatId}`;
+    const avatar=ctx?.characters?.[ctx?.characterId]?.avatar;
+    if(!avatar)return null;
+    return `c|${avatar}|${chatId}`;
+}
+
+async function _runScenePulseRequest(fn,ownerNonce){
+    const token={id:++_spRequestSeq,ownerNonce};
+    _activeSpRequest=token;
+    try{return await fn()}
+    finally{if(_activeSpRequest===token)_activeSpRequest=null}
+}
+
+function _waitForProfileLoaded(ctx,expectedName,expectedId,timeoutMs=15000){
+    const eventSource=ctx?.eventSource;
+    const eventType=ctx?.eventTypes?.CONNECTION_PROFILE_LOADED;
+    if(!eventSource||!eventType)return _sleep(300);
+    return new Promise((resolve,reject)=>{
+        let timer=null;
+        const handler=(loadedName)=>{
+            const selected=document.querySelector('#connection_profiles, #connection_profile')?.value;
+            if(loadedName!==expectedName||selected!==expectedId)return;
+            if(timer)clearTimeout(timer);
+            eventSource.removeListener(eventType,handler);
+            resolve();
+        };
+        eventSource.on(eventType,handler);
+        timer=setTimeout(()=>{
+            eventSource.removeListener(eventType,handler);
+            reject(new Error(`Connection profile switch timed out waiting for ${expectedName}`));
+        },timeoutMs);
+    });
+}
+
+async function _applyProfileAwaited(pid){
+    if(!pid)return;
+    const ctx=SillyTavern.getContext();
+    if(typeof ctx.setConnectionProfile==='function'){
+        await ctx.setConnectionProfile(pid);
+        return;
+    }
+    const select=document.querySelector('#connection_profiles, #connection_profile');
+    if(!select)throw new Error('Connection profile selector not found');
+    const option=Array.from(select.options||[]).find(o=>o.value===pid);
+    if(!option)throw new Error(`Connection profile not found: ${pid}`);
+    const expectedName=String(option.textContent||'').trim();
+    const loaded=_waitForProfileLoaded(ctx,expectedName,pid);
+    select.value=pid;
+    select.dispatchEvent(new Event('change'));
+    await loaded;
+}
+
+async function _applyPresetWithDelay(presetId){
+    if(!presetId)return false;
+    for(const sel of['#settings_preset_openai','#settings_preset_chat']){
+        const el=document.querySelector(sel);
+        if(!el)continue;
+        const has=Array.from(el.options||[]).some(o=>o.value===presetId);
+        if(!has)continue;
+        el.value=presetId;
+        el.dispatchEvent(new Event('change'));
+        await _sleep(200);
+        return true;
+    }
+    return false;
+}
+
+// Serialise ScenePulse's own profile-switch -> request -> restore lifecycle.
+// Regenerate uses soft cancellation, so an invalidated HTTP request may still
+// finish in the background; keeping restore inside this queue prevents two
+// ScenePulse wrappers from restoring connection state out of order.
+export function withProfileAndPreset(pid,pre,fn,{isStale=()=>false,timeoutMs=0,timeoutLabel='generation',onTimeout=()=>{}}={}){
+    const run=_profileWorkTail.then(async()=>{
+        if(isStale()){
+            log('Profile queue: stale work discarded before switching');
+            return null;
+        }
+
+        let pp=null,pr=null;
+        let restoreProfile=false,restorePreset=false;
+        let timeoutId=null;
+        let watchdogStarted=false;
+        let restoreError=null;
+
+        try{
+            // Save chat BEFORE switching profile — prevents message loss if
+            // a profile's own commands trigger CHAT_CHANGED/reload.
+            if(pid||pre)await _ensureChatSavedBounded('Profile pre-switch save');
+            if(isStale()){
+                log('Profile queue: work became stale while waiting to start');
+                return null;
+            }
+
+            if(pid){
+                pp=document.querySelector('#connection_profiles, #connection_profile')?.value||null;
+                restoreProfile=!!pp;
+                await _applyProfileAwaited(pid);
+                if(isStale()){
+                    log('Profile queue: work became stale during profile application');
+                    return null;
+                }
+            }
+
+            // Empty preset means "(Same as current)" — preserve existing semantics.
+            if(pre){
+                for(const sel of['#settings_preset_openai','#settings_preset_chat']){
+                    const el=document.querySelector(sel);
+                    if(!el)continue;
+                    const has=Array.from(el.options||[]).some(o=>o.value===pre);
+                    if(!has)continue;
+                    pr=el.value||null;
+                    restorePreset=!!pr;
+                    await _applyPresetWithDelay(pre);
+                    break;
+                }
+                if(isStale()){
+                    log('Profile queue: work became stale during preset application');
+                    return null;
+                }
+            }
+
+            // The ST stop-button watchdog is meaningful only while this queued
+            // work is actually making its API call. Starting it before the queue
+            // is acquired can falsely reset a legitimate waiter.
+            startStWatchdog();
+            watchdogStarted=true;
+            if(!timeoutMs)return await fn();
+            return await Promise.race([
+                fn(),
+                new Promise((_,reject)=>{
+                    timeoutId=setTimeout(()=>{
+                        try{onTimeout()}catch{}
+                        reject(new Error(`TIMEOUT: ${timeoutLabel} exceeded ${Math.round(timeoutMs/1000)}s with no completion`));
+                    },timeoutMs);
+                }),
+            ]);
+        }finally{
+            if(timeoutId)clearTimeout(timeoutId);
+            if(watchdogStarted)stopStWatchdog();
+            if(restoreProfile||restorePreset){
+                // The request may have saved new data. Preserve the baseline
+                // pre-restore save/delay, but do not release the queue until
+                // restoration has actually completed. Attempt both restores;
+                // a failed restore rejects the wrapper rather than silently
+                // treating the connection state as safe.
+                try{await _ensureChatSavedBounded('Profile pre-restore save')}catch(e){restoreError=e}
+                await _sleep(2000);
+                if(restorePreset){
+                    try{await _applyPresetWithDelay(pr)}catch(e){restoreError=restoreError||e;warn('Preset restore:',e?.message||e)}
+                }
+                if(restoreProfile){
+                    try{await _applyProfileAwaited(pp)}catch(e){restoreError=restoreError||e;warn('Profile restore:',e?.message||e)}
+                }
+                if(restoreError)throw restoreError;
+            }
+        }
+    });
+    _profileWorkTail=run.then(()=>undefined,()=>undefined);
+    return run;
+}
+
+// Cancel: synchronous, instant. Restores ScenePulse UI/state immediately.
+// abortST=false invalidates/unlocks ScenePulse without touching ST's request.
+export function cancelGeneration({abortST=true}={}){
     if(!generating)return;
     const oldNonce=genNonce;
     setGenNonce(genNonce+1); // invalidate in-flight generation
     setCancelRequested(true);
     setGenerating(false);spSetGenerating(false);setBrandState('idle'); // unlock for next generation
+    // Stop the watchdog synchronously. A soft-cancelled request may remain
+    // in flight while a replacement tracker sets generating=true again before
+    // the watchdog's next poll; leaving the old timer alive could reset the
+    // replacement tracker. The replacement starts its own watchdog only after
+    // it acquires the profile queue and reaches the API section.
+    try{stopStWatchdog()}catch{}
     // Defensive reset: the inline-generation timestamp gates extraction ownership.
     // If we cancel without clearing it, a subsequent CHARACTER_MESSAGE_RENDERED from
     // ANOTHER extension (MemoryBooks memory insertion, etc.) would be misattributed
@@ -114,54 +283,42 @@ export function cancelGeneration(){
     try { cleanupGenUI(); } catch {}
     log('CANCEL: nonce',oldNonce,'\u2192',genNonce,'— generation unlocked');
 
-    // Abort SillyTavern's in-flight HTTP request — try every known method
+    // Abort SillyTavern's in-flight HTTP request only when safe. Physical
+    // abort is attempted only while ScenePulse itself is inside an ST API
+    // await; otherwise the visible Stop control may belong to another extension.
     try{
-        const ctx=SillyTavern.getContext();
-        let aborted=false;
+        if(!abortST){
+            log('CANCEL: soft cancel — ST abort skipped');
+        }else if(_activeSpRequest?.ownerNonce!==oldNonce){
+            log('CANCEL: no ScenePulse API request owned by nonce',oldNonce,'— physical ST abort skipped');
+        }else{
+            const ctx=SillyTavern.getContext();
+            let aborted=false;
 
-        // Method 1: ST's abortController on context
-        if(ctx.abortController&&typeof ctx.abortController.abort==='function'){
-            log('CANCEL: aborting via ctx.abortController');
-            ctx.abortController.abort();aborted=true;
-        }
+            // Future-compatible direct controller paths. ST 1.18.0 does not
+            // expose these, but retain them behind the ScenePulse-ownership gate.
+            if(ctx.abortController&&typeof ctx.abortController.abort==='function'){
+                log('CANCEL: aborting via ctx.abortController');
+                ctx.abortController.abort();aborted=true;
+            }
+            if(!aborted&&window.abortController&&typeof window.abortController.abort==='function'){
+                log('CANCEL: aborting via window.abortController');
+                window.abortController.abort();aborted=true;
+            }
 
-        // Method 2: ST's global abortController
-        if(!aborted&&window.abortController&&typeof window.abortController.abort==='function'){
-            log('CANCEL: aborting via window.abortController');
-            window.abortController.abort();aborted=true;
-        }
-
-        // Method 3: Try clicking ST's stop button with multiple known selectors
-        const stopSelectors=['#mes_stop','.mes_stop','#stop_button','.stop_button','#form_sheld .stop_button','[id*="stop"]'];
-        for(const sel of stopSelectors){
-            try{
-                const el=document.querySelector(sel);
-                if(el){
-                    log('CANCEL: found ST stop element:',sel,'visible=',el.offsetParent!==null,'display=',getComputedStyle(el).display);
-                    if(el.offsetParent!==null||getComputedStyle(el).display!=='none'){
-                        el.click();
-                        log('CANCEL: clicked ST stop button via',sel);
-                        aborted=true;break;
-                    }
+            // ST 1.18.0: use only the actual visible message-generation Stop
+            // button. Do not fall through to generic [id*="stop"] selectors.
+            if(!aborted){
+                const stop=document.querySelector('#mes_stop');
+                if(stop?.offsetParent!==null){
+                    stop.click();
+                    log('CANCEL: clicked visible ST #mes_stop');
+                    aborted=true;
                 }
-            }catch(e2){}
-        }
+            }
 
-        // Method 4: Try jQuery click on common stop IDs
-        if(!aborted){
-            try{
-                if(typeof $==='function'){
-                    const $stop=$('#mes_stop, .mes_stop, .stop_button').filter(':visible');
-                    if($stop.length){
-                        $stop.first().trigger('click');
-                        log('CANCEL: jQuery-clicked ST stop button');
-                        aborted=true;
-                    }
-                }
-            }catch(e3){}
+            if(!aborted)log('CANCEL: no safe ST abort mechanism available — API call will complete in background');
         }
-
-        if(!aborted)log('CANCEL: could not find ST abort mechanism — API call will complete in background');
     }catch(e){warn('CANCEL: ST abort attempt failed:',e?.message)}
 
     cleanupGenUI();
@@ -219,13 +376,25 @@ export async function generateTracker(mesIdx,partKey,opts){
     if(!getSettings().enabled){log('generateTracker: extension disabled, skipping');return null}
     if(generating){warn('Busy, nonce=',genNonce);return null}
     setGenerating(true);setCancelRequested(false);spSetGenerating(true);setBrandState('generating');
-    // v6.27.19: ST DOM watchdog (poll #mes_stop visibility every 3s).
-    // Catches ECONNRESET-class hangs in ~6-9s where ST has stopped
-    // generating but our await chain didn't reject. Auto-stops when
-    // SP's `generating` goes false (cleanup at line 432 / 656).
-    startStWatchdog();
     const myNonce=genNonce+1;setGenNonce(myNonce);
     const genStartMs=Date.now();
+    const sourceContext=SillyTavern.getContext();
+    const sourceChatIdentity=getScenePulseChatIdentity(sourceContext);
+    const sourceMessage=sourceContext?.chat?.[mesIdx];
+    const sourceSendDate=sourceMessage?.send_date;
+    const sourceSwipeId=Number(sourceMessage?.swipe_id??0);
+    const sourceMessageFingerprint=sourceMessage&&!sourceMessage.is_user?getMessageFingerprint(sourceMessage):null;
+    let timedOut=false;
+    const sourceVersionChanged=()=>{
+        const currentContext=SillyTavern.getContext();
+        if(getScenePulseChatIdentity(currentContext)!==sourceChatIdentity)return true;
+        const currentMessage=currentContext?.chat?.[mesIdx];
+        if(!currentMessage||currentMessage.is_user)return true;
+        if(sourceSendDate!==undefined&&sourceSendDate!==null&&currentMessage.send_date!==sourceSendDate)return true;
+        if(sourceMessageFingerprint&&getMessageFingerprint(currentMessage)!==sourceMessageFingerprint)return true;
+        return false;
+    };
+    const isTrackerStale=()=>timedOut||myNonce!==genNonce||sourceVersionChanged();
     const settings=getSettings();const schema=getActiveSchema();const sysPr=getActivePrompt({ hasPrevState: !!getLatestSnapshot(), isDelta: shouldUseDelta() });
     let profileOverride=opts?.profile||settings.connectionProfile;
     let presetOverride=opts?.preset||settings.chatPreset;
@@ -288,15 +457,15 @@ export async function generateTracker(mesIdx,partKey,opts){
         log('Prompt length:',promptLen,'chars (~',Math.round(promptLen/4),'tokens)');
         for(let a=0;a<=settings.maxRetries;a++){
             // Nonce check at every opportunity — if cancelled, bail immediately
-            if(myNonce!==genNonce){log('STALE nonce',myNonce,'(current',genNonce+') \u2014 discarding silently');return null}
+            if(isTrackerStale()){log('STALE tracker work before API attempt — discarding silently');return null}
             try{if(a>0){log(`Retry ${a}/${settings.maxRetries}`);await new Promise(r=>setTimeout(r,1000*a))}
                 let raw;
                 log('Attempt',a+1,': calling generateQuietPrompt... nonce=',myNonce);
                 try{
-                    raw=await generateQuietPrompt({quietPrompt:prompt,jsonSchema:settings.promptMode==='native'?schema:undefined});
+                    raw=await _runScenePulseRequest(()=>generateQuietPrompt({quietPrompt:prompt,jsonSchema:settings.promptMode==='native'?schema:undefined}),myNonce);
                 }
                 catch(e){
-                    if(myNonce!==genNonce){log('STALE after quiet error, nonce',myNonce);return null}
+                    if(isTrackerStale()){log('STALE tracker work after quiet error — discarding');return null}
                     const msg=e?.message||String(e);
                     warn('API error:',msg);
                     // ── Fatal API errors: stop immediately, no retry ──
@@ -325,7 +494,7 @@ export async function generateTracker(mesIdx,partKey,opts){
                     // v6.19.0 (issue #16): route through applyPromptRole so the
                     // active profile's systemPromptRole (system/user/assistant)
                     // takes effect before the call. Default 'system' is a no-op.
-                    try{raw=await generateRaw(applyPromptRole({systemPrompt:sysPr,prompt:`RECENT:\n${ctxText}${snapCtx}\n\nOutput ONLY valid JSON.`}))}
+                    try{raw=await _runScenePulseRequest(()=>generateRaw(applyPromptRole({systemPrompt:sysPr,prompt:`RECENT:\n${ctxText}${snapCtx}\n\nOutput ONLY valid JSON.`})),myNonce)}
                     catch(e2){
                         const msg2=e2?.message||String(e2);
                         err('Fallback also failed:',msg2);
@@ -341,7 +510,7 @@ export async function generateTracker(mesIdx,partKey,opts){
                     }
                 }
                 // Check nonce AFTER API returns — this is the critical discard point
-                if(myNonce!==genNonce){log('STALE after API return, nonce',myNonce,'(current',genNonce+') \u2014 discarding response');return null}
+                if(isTrackerStale()){log('STALE tracker work after API return — discarding response');return null}
                 if(!raw||raw==='{}'){warn('Empty response on attempt',a+1);continue}
                 const rawStr=String(raw);
                 const rawLen=rawStr.length;
@@ -439,13 +608,12 @@ export async function generateTracker(mesIdx,partKey,opts){
     // cleanup at line 432 then runs normally and the UI unlocks.
     const ENGINE_TIMEOUT_MS = 180000;
     try{
-        result = await Promise.race([
-            withProfileAndPreset(profileOverride,presetOverride,doGen),
-            new Promise((_, reject) => setTimeout(
-                () => reject(new Error('TIMEOUT: tracker generation exceeded ' + (ENGINE_TIMEOUT_MS / 1000) + 's with no completion (network drop or upstream hang?)')),
-                ENGINE_TIMEOUT_MS
-            )),
-        ]);
+        result = await withProfileAndPreset(profileOverride,presetOverride,doGen,{
+            isStale:isTrackerStale,
+            timeoutMs:ENGINE_TIMEOUT_MS,
+            timeoutLabel:'tracker generation',
+            onTimeout:()=>{timedOut=true},
+        });
     }
     catch(e){
         err('Gen:',e);
@@ -457,6 +625,11 @@ export async function generateTracker(mesIdx,partKey,opts){
     if(myNonce!==genNonce){
         log('POST-GEN: stale nonce',myNonce,'(current',genNonce+') \u2014 result discarded, state untouched');
         return null; // Don't reset generating — the newer cancel/gen already did
+    }
+    if(sourceVersionChanged()){
+        log('POST-GEN: originating chat/message version changed — result discarded, state untouched');
+        cancelGeneration({abortST:false});
+        return null;
     }
     setGenerating(false);spSetGenerating(false);setCancelRequested(false);cleanupGenUI();setBrandState(result?'idle':'error');
     if(result){
@@ -522,7 +695,6 @@ export async function generateTracker(mesIdx,partKey,opts){
         log('  scene:',result.sceneTopic?'topic=\u2713':'topic=\u2717',result.sceneMood?'mood=\u2713':'mood=\u2717',result.sceneTension?'tension=\u2713':'tension=\u2717');
         if(result.characters?.length){for(const ch of result.characters)log('  char:',ch.name,'role=',ch.role?'\u2713':'\u2717','thought=',ch.innerThought?'\u2713':'\u2717','hair=',ch.hair?'\u2713':'\u2717')}
         if(result.relationships?.length){for(const r of result.relationships)log('  rel:',r.name,'aff=',r.affection,'trust=',r.trust,'desire=',r.desire,'compat=',r.compatibility)}
-        setCurrentSnapshotMesIdx(mesIdx);
         // Embed generation metadata into snapshot for persistence
         // v6.8.50: deltaTurnsSinceFull tracks how many consecutive delta
         // turns have elapsed since the last full-state generation. When
@@ -533,10 +705,27 @@ export async function generateTracker(mesIdx,partKey,opts){
         const _wasDelta = shouldUseDelta();
         const _prevCounter = (getLatestSnapshot()?._spMeta?.deltaTurnsSinceFull ?? 0);
         result._spMeta={promptTokens:genMeta.promptTokens,completionTokens:genMeta.completionTokens,elapsed:genMeta.elapsed,source:lastGenSource,injectionMethod:getSettings().injectionMethod||'inline',deltaMode:_wasDelta,deltaTurnsSinceFull:_wasDelta?_prevCounter+1:0};
+        if(sourceSendDate!==undefined&&sourceSendDate!==null){
+            result._spMeta.srcSendDate=sourceSendDate;
+        }
+        result._spMeta.srcSwipeId=sourceSwipeId;
+        if(sourceMessageFingerprint)result._spMeta.srcMessageFingerprint=sourceMessageFingerprint;
         // v6.9.8: first-run success confirmation — if this is the very
         // first snapshot in the chat, show a welcome toast so the user
         // knows ScenePulse is working.
         const _isFirstSnap = Object.keys(getTrackerData().snapshots || {}).length === 0;
+        // Last ownership check immediately before persistence. This closes
+        // same-chat message mutations that are not accompanied by a lifecycle event.
+        if(myNonce!==genNonce){
+            log('PRE-SAVE: stale nonce — snapshot discarded');
+            return null;
+        }
+        if(sourceVersionChanged()){
+            log('PRE-SAVE: originating chat/message version changed — snapshot discarded');
+            cancelGeneration({abortST:false});
+            return null;
+        }
+        setCurrentSnapshotMesIdx(mesIdx);
         saveSnapshot(mesIdx,result);log('Snapshot saved for mesIdx=',mesIdx,'keys=',Object.keys(result).length,'elapsed=',genMeta.elapsed.toFixed(1)+'s','~tokens:',genMeta.promptTokens+genMeta.completionTokens);
         if (_isFirstSnap) {
             const _charCount = (result.characters || []).length;
@@ -583,13 +772,10 @@ export async function continuationReprompt(narrativeText, opts){
     if(!getSettings().enabled){log('continuationReprompt: extension disabled, skipping');return null}
     if(generating){warn('continuationReprompt: busy, nonce=',genNonce);return null}
     setGenerating(true);setCancelRequested(false);spSetGenerating(true);setBrandState('generating');
-    // v6.27.19: ST DOM watchdog (poll #mes_stop visibility every 3s).
-    // Catches ECONNRESET-class hangs in ~6-9s where ST has stopped
-    // generating but our await chain didn't reject. Auto-stops when
-    // SP's `generating` goes false (cleanup at line 432 / 656).
-    startStWatchdog();
     const myNonce=genNonce+1;setGenNonce(myNonce);
     const startMs=Date.now();
+    let timedOut=false;
+    const isContinuationStale=()=>timedOut||myNonce!==genNonce;
     const settings=getSettings();
     const profileOverride=opts?.profile||settings.connectionProfile;
     const presetOverride=opts?.preset||settings.chatPreset;
@@ -622,21 +808,21 @@ Output the JSON object now:`;
     log('Continuation prompt length:',prompt.length,'chars (~',Math.round(prompt.length/4),'tokens)');
     const doGen=async()=>{
         const{generateQuietPrompt,generateRaw}=SillyTavern.getContext();
-        if(myNonce!==genNonce){log('CONTINUATION: stale nonce',myNonce,'(current',genNonce+') — bailing');return null}
+        if(isContinuationStale()){log('CONTINUATION: stale before API call — bailing');return null}
         try{
             log('Continuation: calling generateQuietPrompt... nonce=',myNonce);
             let raw;
             try{
-                raw=await generateQuietPrompt({quietPrompt:prompt,jsonSchema:settings.promptMode==='native'?getActiveSchema():undefined});
+                raw=await _runScenePulseRequest(()=>generateQuietPrompt({quietPrompt:prompt,jsonSchema:settings.promptMode==='native'?getActiveSchema():undefined}),myNonce);
             }catch(e){
-                if(myNonce!==genNonce){log('CONTINUATION: stale after API error');return null}
+                if(isContinuationStale()){log('CONTINUATION: stale after API error');return null}
                 warn('Continuation generateQuietPrompt error:',e?.message||String(e));
                 // Try generateRaw as a single fallback (no retry loop — keep this path cheap)
                 // v6.19.0 (issue #16): route through applyPromptRole.
-                try{raw=await generateRaw(applyPromptRole({systemPrompt:sysPr,prompt:`Narrative:\n${narrativeText}${prevState}\n\nOutput ONLY the tracker JSON object.`}))}
+                try{raw=await _runScenePulseRequest(()=>generateRaw(applyPromptRole({systemPrompt:sysPr,prompt:`Narrative:\n${narrativeText}${prevState}\n\nOutput ONLY the tracker JSON object.`})),myNonce)}
                 catch(e2){err('Continuation generateRaw also failed:',e2?.message||String(e2));return null}
             }
-            if(myNonce!==genNonce){log('CONTINUATION: stale after API return — discarding');return null}
+            if(isContinuationStale()){log('CONTINUATION: stale after API return — discarding');return null}
             if(!raw||raw==='{}'){warn('Continuation: empty response');return null}
             const rawStr=String(raw);
             setLastRawResponse(rawStr);
@@ -665,13 +851,12 @@ Output the JSON object now:`;
     // its own 180s budget.
     const CONTINUATION_TIMEOUT_MS = 60000;
     try{
-        result = await Promise.race([
-            withProfileAndPreset(profileOverride,presetOverride,doGen),
-            new Promise((_, reject) => setTimeout(
-                () => reject(new Error('TIMEOUT: continuation reprompt exceeded ' + (CONTINUATION_TIMEOUT_MS / 1000) + 's')),
-                CONTINUATION_TIMEOUT_MS
-            )),
-        ]);
+        result = await withProfileAndPreset(profileOverride,presetOverride,doGen,{
+            isStale:isContinuationStale,
+            timeoutMs:CONTINUATION_TIMEOUT_MS,
+            timeoutLabel:'continuation reprompt',
+            onTimeout:()=>{timedOut=true},
+        });
     }
     catch(e){err('Continuation:',e)}
     if(myNonce!==genNonce){
