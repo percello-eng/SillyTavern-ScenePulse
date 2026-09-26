@@ -26,6 +26,7 @@ import {
     getConnectionProfiles, getChatPresets, shouldUseDelta, getMessageFingerprint
 } from '../settings.js';
 import { normalizeTracker } from '../normalize.js';
+import { projectActiveState } from '../active-state.js';
 import { applyPromptRole } from '../prompts/role.js';
 import { cleanJson } from './extraction.js';
 import { mergeDelta } from './delta-merge.js';
@@ -334,14 +335,14 @@ export function cancelGeneration({abortST=true}={}){
 }
 
 // Smart snapshot selection: score snapshots by significance (location changes, new characters, quest completions, tension shifts)
-function _selectSignificantSnapshots(allSnaps,sortedDesc,count){
+function _selectSignificantSnapshots(allSnaps,sortedDesc,count,activeSchema){
     // Always include the most recent
     const scores=[];
     let prevSnap=null;
     // Walk chronologically
     const chronological=[...sortedDesc].reverse();
     for(const key of chronological){
-        const snap=allSnaps[String(key)];if(!snap)continue;
+        const snap=projectActiveState(allSnaps[String(key)],activeSchema);if(!snap)continue;
         let score=0;
         if(prevSnap){
             // Location change
@@ -422,7 +423,7 @@ export async function generateTracker(mesIdx,partKey,opts){
         const ctxText=recent.map(m=>`${m.is_user?'{{user}}':(m.name||'{{char}}')}: ${m.mes}`).join('\n\n');
         const lastSnap=getLatestSnapshot();
         // Filter resolved quests from snapshot before embedding in prompt
-        function _cleanSnapForPrompt(s){const c={...s};for(const k of['mainQuests','sideQuests']){if(Array.isArray(c[k]))c[k]=c[k].filter(q=>q.urgency!=='resolved')}delete c.activeTasks;delete c._spMeta;if(Array.isArray(c.charactersPresent)&&c.charactersPresent.length>0){const ps=new Set(c.charactersPresent.map(n=>(n||'').toLowerCase().trim()));if(Array.isArray(c.characters)){const present=c.characters.filter(ch=>ps.has((ch.name||'').toLowerCase().trim()));const offScene=c.characters.filter(ch=>!ps.has((ch.name||'').toLowerCase().trim())).map(ch=>({name:ch.name,role:ch.role||'',aliases:ch.aliases||[]}));c.characters=present;if(offScene.length)c._offSceneCharacters=offScene}if(Array.isArray(c.relationships))c.relationships=c.relationships.filter(r=>ps.has((r.name||'').toLowerCase().trim()))}return c}
+        function _cleanSnapForPrompt(s){const c=projectActiveState(s,schema.value);for(const k of['mainQuests','sideQuests']){if(Array.isArray(c[k]))c[k]=c[k].filter(q=>q.urgency!=='resolved')}if(Array.isArray(c.charactersPresent)&&c.charactersPresent.length>0){const ps=new Set(c.charactersPresent.map(n=>(n||'').toLowerCase().trim()));if(Array.isArray(c.characters)){const present=c.characters.filter(ch=>ps.has((ch.name||'').toLowerCase().trim()));const offScene=c.characters.filter(ch=>!ps.has((ch.name||'').toLowerCase().trim())).map(ch=>({name:ch.name,role:ch.role||'',aliases:ch.aliases||[]}));c.characters=present;if(offScene.length)c._offSceneCharacters=offScene}if(Array.isArray(c.relationships))c.relationships=c.relationships.filter(r=>ps.has((r.name||'').toLowerCase().trim()))}return c}
         let snapCtx='';
         if(lastSnap){
             const allSnaps=getTrackerData().snapshots;
@@ -431,11 +432,11 @@ export async function generateTracker(mesIdx,partKey,opts){
             // Smart snapshot selection: pick most significant state changes instead of just N most recent
             let snapsToEmbed;
             if(snapCount>1&&sorted.length>2){
-                snapsToEmbed=_selectSignificantSnapshots(allSnaps,sorted,snapCount);
+                snapsToEmbed=_selectSignificantSnapshots(allSnaps,sorted,snapCount,schema.value);
             }else{
                 snapsToEmbed=sorted.slice(0,snapCount).reverse();
             }
-            const hasEmptyChars=!lastSnap.characters||!lastSnap.characters.length;
+            const hasEmptyChars=Object.hasOwn(schema.value.properties,'characters')&&(!lastSnap.characters||!lastSnap.characters.length);
             if(snapCount<=1){
                 snapCtx=`\n\nPREVIOUS STATE (for reference \u2014 update as needed):\n${JSON.stringify(_cleanSnapForPrompt(lastSnap),null,2)}`;
             }else{
@@ -444,7 +445,7 @@ export async function generateTracker(mesIdx,partKey,opts){
                     snapCtx+=`\n--- Snapshot from message #${k} ---\n${JSON.stringify(_cleanSnapForPrompt(allSnaps[String(k)]),null,2)}`;
                 }
             }
-            snapCtx+=settings.panels?.quests!==false?`\n\nIMPORTANT: Quest Journal must be from {{user}}'s perspective. If {{char}} is hostile, {{user}}'s quests OPPOSE {{char}}'s goals. If {{char}} is an ally, {{user}}'s quests SUPPORT them \u2014 but framed as {{user}}'s action. NEVER write what {{char}} is doing \u2014 write what {{user}} is doing about it. NEVER drop unresolved quests.`:`\n\nIMPORTANT: Carry forward unchanged details. Only update what changed in the story.`;
+            snapCtx+=['mainQuests','sideQuests'].some(k=>Object.hasOwn(schema.value.properties,k))?`\n\nIMPORTANT: Quest Journal must be from {{user}}'s perspective. If {{char}} is hostile, {{user}}'s quests OPPOSE {{char}}'s goals. If {{char}} is an ally, {{user}}'s quests SUPPORT them \u2014 but framed as {{user}}'s action. NEVER write what {{char}} is doing \u2014 write what {{user}} is doing about it. NEVER drop unresolved quests.`:`\n\nIMPORTANT: Carry forward unchanged details. Only update what changed in the story.`;
             if(hasEmptyChars){
                 snapCtx+=`\n\nWARNING: The previous state has EMPTY characters. This is a bug \u2014 you MUST generate full character details for ALL characters present in the scene.`;
                 log('Previous state has empty characters \u2014 added generation warning');
@@ -636,7 +637,7 @@ export async function generateTracker(mesIdx,partKey,opts){
         log('Raw output keys:',Object.keys(result).join(', '));
         log('Raw characters?',Array.isArray(result.characters)?'array('+result.characters.length+')':typeof result.characters);
         log('Raw relationships?',Array.isArray(result.relationships)?'array('+result.relationships.length+')':typeof result.relationships);
-        result=normalizeTracker(result);
+        result=normalizeTracker(result,schema.value);
         // ── SECTION MERGE: Only accept fields belonging to the requested section ──
         if(partKey){
             const SECTION_FIELDS={
@@ -651,7 +652,7 @@ export async function generateTracker(mesIdx,partKey,opts){
             if(allowedFields||partKey.startsWith('custom_')){
                 const existingSnap=getSnapshotFor(mesIdx)||getLatestSnapshot();
                 if(existingSnap){
-                    const merged=normalizeTracker(existingSnap);
+                    const merged=normalizeTracker(existingSnap,schema.value);
                     if(allowedFields){
                         const _entityArrays={characters:'name',relationships:'name',mainQuests:'name',sideQuests:'name'};
                         for(const f of allowedFields){
@@ -787,7 +788,7 @@ export async function continuationReprompt(narrativeText, opts){
     const lastSnap=getLatestSnapshot();
     let prevState='';
     if(lastSnap){
-        function _cleanSnap(s){const c={...s};for(const k of['mainQuests','sideQuests']){if(Array.isArray(c[k]))c[k]=c[k].filter(q=>q.urgency!=='resolved')}delete c.activeTasks;delete c._spMeta;if(Array.isArray(c.charactersPresent)&&c.charactersPresent.length>0){const ps=new Set(c.charactersPresent.map(n=>(n||'').toLowerCase().trim()));if(Array.isArray(c.characters)){const present=c.characters.filter(ch=>ps.has((ch.name||'').toLowerCase().trim()));const offScene=c.characters.filter(ch=>!ps.has((ch.name||'').toLowerCase().trim())).map(ch=>({name:ch.name,role:ch.role||'',aliases:ch.aliases||[]}));c.characters=present;if(offScene.length)c._offSceneCharacters=offScene}if(Array.isArray(c.relationships))c.relationships=c.relationships.filter(r=>ps.has((r.name||'').toLowerCase().trim()))}return c}
+        function _cleanSnap(s){const c=projectActiveState(s,getActiveSchema().value);for(const k of['mainQuests','sideQuests']){if(Array.isArray(c[k]))c[k]=c[k].filter(q=>q.urgency!=='resolved')}if(Array.isArray(c.charactersPresent)&&c.charactersPresent.length>0){const ps=new Set(c.charactersPresent.map(n=>(n||'').toLowerCase().trim()));if(Array.isArray(c.characters)){const present=c.characters.filter(ch=>ps.has((ch.name||'').toLowerCase().trim()));const offScene=c.characters.filter(ch=>!ps.has((ch.name||'').toLowerCase().trim())).map(ch=>({name:ch.name,role:ch.role||'',aliases:ch.aliases||[]}));c.characters=present;if(offScene.length)c._offSceneCharacters=offScene}if(Array.isArray(c.relationships))c.relationships=c.relationships.filter(r=>ps.has((r.name||'').toLowerCase().trim()))}return c}
         prevState=`\n\nPREVIOUS STATE (carry forward unchanged details, update only what changed):\n${JSON.stringify(_cleanSnap(lastSnap),null,2)}`;
     }
     // v6.9.1: use the shared shouldUseDelta() helper to respect the

@@ -31,6 +31,7 @@ import { showChatBanner, cleanupGenUI } from '../ui/loading.js';
 import { startStWatchdog } from './st-watchdog.js';
 import { getActiveProfile } from '../profiles.js';
 import { getActivePromptRole } from '../prompts/role.js';
+import { projectActiveState } from '../active-state.js';
 
 // ── Stall watchdog (v6.27.16) ─────────────────────────────────────
 //
@@ -106,7 +107,7 @@ export function buildInlineTrackerPrompt(){
     // leaking old values of it would re-teach the model to produce them.
     function _cleanSnap(s){
         if(!s)return null;
-        const c={...s};
+        const c=projectActiveState(s,getActiveSchema().value);
         for(const k of['mainQuests','sideQuests']){if(Array.isArray(c[k]))c[k]=c[k].filter(q=>q.urgency!=='resolved')}
         delete c.activeTasks;delete c._spMeta;
         // v6.9.1: prune characters and relationships to only those
@@ -378,7 +379,7 @@ export const scenePulseInterceptor=async function(chat,cs,abort,type){
         // SEPARATE MODE: Just embed previous snapshot data for context
         if(!s.embedSnapshots)return;
         const snap=getLatestSnapshot();if(!snap){log('Interceptor: no snapshot to embed');return}
-        const snapJson=JSON.stringify(snap,null,2);
+        const snapJson=JSON.stringify(projectActiveState(snap,getActiveSchema().value),null,2);
         chat.splice(Math.max(0,chat.length-1),0,{
             is_user:s.embedRole==='user',is_system:s.embedRole==='system',
             name:s.embedRole==='system'?'System':'ScenePulse',

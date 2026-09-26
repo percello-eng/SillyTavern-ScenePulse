@@ -2,7 +2,7 @@
 // Tracks tension + mood across snapshots and suggests pacing interventions
 
 import { log } from './logger.js';
-import { getTrackerData } from './settings.js';
+import { getTrackerData, getActiveSchema } from './settings.js';
 import { t } from './i18n.js';
 
 const TENSION_RANK = { calm: 0, low: 1, moderate: 2, high: 3, critical: 4 };
@@ -13,6 +13,8 @@ const STAGNATION_THRESHOLD = 4; // consecutive snapshots with same tension to fl
  * Returns null if no stagnation detected, or an object with suggestions.
  */
 export function detectStagnation() {
+    const fields = getActiveSchema().value?.properties || {};
+    if (!['sceneTension', 'sceneMood', 'sceneTopic'].some(key => Object.hasOwn(fields, key))) return null;
     const data = getTrackerData();
     const snapKeys = Object.keys(data.snapshots || {}).map(Number).sort((a, b) => a - b);
     if (snapKeys.length < STAGNATION_THRESHOLD) return null;
@@ -25,9 +27,9 @@ export function detectStagnation() {
     for (const key of recent) {
         const snap = data.snapshots[String(key)];
         if (!snap) continue;
-        tensions.push((snap.sceneTension || '').toLowerCase());
-        moods.push((snap.sceneMood || '').toLowerCase());
-        topics.push((snap.sceneTopic || '').toLowerCase());
+        tensions.push(fields.sceneTension ? (snap.sceneTension || '').toLowerCase() : '');
+        moods.push(fields.sceneMood ? (snap.sceneMood || '').toLowerCase() : '');
+        topics.push(fields.sceneTopic ? (snap.sceneTopic || '').toLowerCase() : '');
     }
 
     const result = { stagnant: false, type: null, tension: null, suggestion: null };
@@ -62,9 +64,10 @@ export function detectStagnation() {
     }
 
     // Check topic stagnation
-    if (!result.stagnant && topics.length >= STAGNATION_THRESHOLD) {
+    if (!result.stagnant && fields.sceneTopic && topics.length >= STAGNATION_THRESHOLD && topics[0]) {
         // Check if topics are too similar (using shared word count)
         const words0 = new Set(topics[0].split(/\s+/).filter(w => w.length > 3));
+        if (!words0.size) return null;
         const overlaps = topics.slice(1).filter(t => {
             const tw = t.split(/\s+/).filter(w => w.length > 3);
             const shared = tw.filter(w => words0.has(w)).length;

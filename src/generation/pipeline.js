@@ -7,7 +7,7 @@ import {
     setCurrentSnapshotMesIdx, setLastGenSource, setLastRawResponse, setLastDeltaPayload,
     addSessionTokens, setLastDeltaSavings, _lastDeltaSavings
 } from '../state.js';
-import { getSettings, getLatestSnapshot, saveSnapshot, ensureChatSaved, shouldUseDelta } from '../settings.js';
+import { getSettings, getActiveSchema, getLatestSnapshot, saveSnapshot, ensureChatSaved, shouldUseDelta } from '../settings.js';
 import { normalizeTracker } from '../normalize.js';
 import { mergeDelta } from './delta-merge.js';
 import { updatePanel } from '../ui/update-panel.js';
@@ -34,6 +34,7 @@ import { classifyTimeChange } from '../temporal-check.js';
  */
 export async function processExtraction(mesIdx, extracted, source, opts = {}) {
     const s = getSettings();
+    const activeSchema = getActiveSchema().value;
     const { promptTokens = 0, completionTokens = 0, elapsed = 0 } = opts;
 
     setLastGenSource(source);
@@ -63,6 +64,7 @@ export async function processExtraction(mesIdx, extracted, source, opts = {}) {
         // Mirrors engine.js:367-380. (Issue #11)
         if (prevSnap) {
             for (const k of ['characters', 'relationships']) {
+                if (!Object.hasOwn(activeSchema.properties, k)) continue;
                 if (Array.isArray(extracted[k]) && Array.isArray(prevSnap[k])) {
                     const newNames = new Set(extracted[k].map(e => (e.name || '').toLowerCase().trim()));
                     for (const prev of prevSnap[k]) {
@@ -81,7 +83,7 @@ export async function processExtraction(mesIdx, extracted, source, opts = {}) {
     const _warnings = validateExtraction(extracted);
 
     // Normalize
-    const norm = normalizeTracker(extracted);
+    const norm = normalizeTracker(extracted, activeSchema);
     setCurrentSnapshotMesIdx(mesIdx);
 
     // Attach validation warnings for Inspector
@@ -94,7 +96,9 @@ export async function processExtraction(mesIdx, extracted, source, opts = {}) {
     // anchors all skip cleanly. Pure call — see src/temporal-check.js.
     let _isGroupChat = false;
     try { _isGroupChat = !!SillyTavern.getContext().groupId; } catch {}
-    const _tc = classifyTimeChange({ prev: prevSnap, next: norm, isGroupChat: _isGroupChat });
+    const _tc = Object.hasOwn(activeSchema.properties, 'time')
+        ? classifyTimeChange({ prev: prevSnap, next: norm, isGroupChat: _isGroupChat })
+        : { action: 'none' };
     if (_tc.action === 'rewrite') {
         const _from = _tc.signals.nextTime;
         warn('TemporalCheck: rewriting time', _from, '→', _tc.newTime, '(' + _tc.reason + ')');

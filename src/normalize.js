@@ -7,6 +7,7 @@ import { _isTimelineScrub } from './state.js';
 import { getLatestSnapshot } from './settings.js';
 import { charColor } from './color.js';
 import { coerceRelPhase } from './rel-phase.js';
+import { projectActiveState } from './active-state.js';
 
 // ── Normalization cache (WeakMap — auto-clears when snapshot objects are GC'd) ──
 const _normCache = new WeakMap();
@@ -96,9 +97,13 @@ export function isUserName(name) {
 }
 
 // ── Normalization ──
-export function normalizeTracker(d){
+export function normalizeTracker(d, activeSchema){
     if(!d||typeof d!=='object')return d;
-    if(_normCache.has(d)) return _normCache.get(d);
+    if(!activeSchema&&_normCache.has(d)) return _normCache.get(d);
+    // Generation supplies its schema; historical/display normalization keeps
+    // the legacy shape without changing saved snapshots on read. Preserve
+    // input aliases/nested formats until the normalizer has interpreted them.
+    const _enabled=activeSchema?.properties;
     const _verbose=!_isTimelineScrub; // Suppress verbose logging during rapid scrubbing
 
     // ── GLM-5 Unwrapper: flatten nested object structures ──
@@ -605,7 +610,7 @@ export function normalizeTracker(d){
     // unnecessary and actively harmful.
     if(!o.witnesses||!o.witnesses.length)o.witnesses=[];
     // Scene fields: try to extract from environment sub-objects or sceneSummary
-    if(!o.sceneTension){
+    if((!_enabled||_enabled.sceneTension)&&!o.sceneTension){
         // Infer from sound/elapsed/context clues
         const ctx=(o.soundEnvironment||'')+(o.elapsed||'')+(o.sceneSummary||'');
         if(/critical|emergency|scream|weapon|blood|dying/i.test(ctx))o.sceneTension='critical';
@@ -742,6 +747,7 @@ export function normalizeTracker(d){
     try{const _prev=getLatestSnapshot();if(_prev){
         // Scalar fields: carry forward if current is empty string
         for(const _ck of['time','date','elapsed','location','weather','temperature','soundEnvironment','sceneTopic','sceneMood','sceneInteraction','sceneTension','sceneSummary']){
+            if(_enabled&&!_enabled[_ck])continue;
             if(!o[_ck]&&_prev[_ck]){o[_ck]=_prev[_ck];if(_verbose)log('Carry-forward:',_ck)}
         }
         // v6.8.45: REMOVED "carry forward charactersPresent if empty".
@@ -798,6 +804,7 @@ export function normalizeTracker(d){
         // Custom panel fields: carry forward any non-metadata key that is empty in o but populated in prev
         for(const _pk of Object.keys(_prev)){
             if(_pk.startsWith('_sp'))continue;
+            if(_enabled&&!_enabled[_pk])continue;
             if(o[_pk]===''&&_prev[_pk]!==''){o[_pk]=_prev[_pk];if(_verbose)log('Custom carry-forward:',_pk)}
         }
     }}catch(e){/* carry-forward is best-effort */}
@@ -815,6 +822,7 @@ export function normalizeTracker(d){
     }
     if(_verbose)auditFields('normalizeTracker',o,['time','date','elapsed','location','weather','temperature','soundEnvironment','sceneTopic','sceneMood','sceneInteraction','sceneTension','sceneSummary','witnesses','charactersPresent','mainQuests','sideQuests','plotBranches','northStar','relationships','characters']);
     if(d._spMeta)o._spMeta=d._spMeta;
+    if(activeSchema?.properties)return projectActiveState(o,activeSchema);
     _normCache.set(d, o);
     return o;
 }
